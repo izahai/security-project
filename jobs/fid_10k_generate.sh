@@ -1,10 +1,20 @@
 #!/bin/bash
 
-DIRS=("")
-NUMS=("999")
+# Concepts to generate the 10k COCO images for. Override from the CLI:
+#   bash jobs/fid_10k_generate.sh nudity church          (default: all three)
+CONCEPTS=(nudity VanGogh church)
+[ $# -gt 0 ] && CONCEPTS=("$@")
 
-GPU_START=0  # GPU starting ID
-GPU_END=7    # GPU ending ID
+CKPT_DIR="results/results_with_AEGIS/AEGIS/models"
+NUMS=("999")   # --save_interval 1000 leaves exactly the epoch-999 checkpoint
+
+# generate-example-img.py appends .pt and loads it into a diffusers
+# UNet2DConditionModel, so point at the Diffusers-* file, not the Compvis- one.
+DIRS=()
+for c in "${CONCEPTS[@]}"; do DIRS+=("$CKPT_DIR/Diffusers-UNet-full-$c-epoch"); done
+
+GPU_START=0
+GPU_END=$(( $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l) - 1 ))
 
 JOB_NUM=1
 
@@ -37,7 +47,7 @@ for dir in "${DIRS[@]}"; do
         CUDA_VISIBLE_DEVICES=$GPU python train-scripts/generate-example-img.py \
             --prompts_path data/prompts/coco_10k.csv \
             --folder_suffix fid_10k \
-            --save_path ${dir}_$num &
+            --ddim_steps 50             --save_path ${dir}_$num &
 
         # Sleep for a bit to make sure the job starts
         sleep 5

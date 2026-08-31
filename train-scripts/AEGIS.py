@@ -14,12 +14,16 @@ import wandb
 from pathlib import Path
 import os
 
-wandb.login(key='')
+if os.environ.get('WANDB_API_KEY'):
+    wandb.login(key=os.environ['WANDB_API_KEY'])
+else:
+    os.environ['WANDB_MODE'] = 'disabled'
 
 class GP:
-    def __init__(self, parameter_orig, mu=0.2):
+    def __init__(self, parameter_orig, mu=0.1, w_cap=1.0):
         self.parameter_orig = parameter_orig
         self.mu = mu
+        self.w_cap = w_cap
         self.pre_g_hat = []
         self.t = 0
         self.w = []
@@ -50,7 +54,7 @@ class GP:
                     if self.t != 0:
                         tmp1=torch.dot(grad_e,self.pre_g_hat[index])
                         delta_w = torch.sign(tmp1).detach()
-                        new_w=max(self.w_init, min(self.w[index]-self.mu*delta_w,1e6))
+                        new_w=max(self.w_init, min(self.w[index]-self.mu*delta_w,self.w_cap))
                         self.w[index] = new_w
                         w+=new_w
                         self.pre_g_hat[index]=grad_proj_flatten.detach()
@@ -59,7 +63,7 @@ class GP:
                         delta_w = torch.sign(tmp1).detach()
                         self.m.append(0.)
                         self.v.append(0.)
-                        new_w=max(self.w_init, min(self.w_init-self.mu*delta_w,1e6))
+                        new_w=max(self.w_init, min(self.w_init-self.mu*delta_w,self.w_cap))
                         self.w.append(new_w)
                         self.pre_g_hat.append(grad_proj_flatten.detach())
                         w+=new_w
@@ -70,15 +74,14 @@ class GP:
                         tmp1=torch.dot(grad_e, self.pre_g_hat[index])
                         # tmp1=grad_e*self.pre_g_hat[index]
                         delta_w = torch.sign(tmp1).detach()
-                        new_w=max(self.w_init, min(self.w[index]-self.mu*delta_w,1e6))
+                        new_w=max(self.w_init, min(self.w[index]-self.mu*delta_w,self.w_cap))
                         self.w[index] = new_w
                         w+=new_w
                         self.pre_g_hat[index] = grad_proj_flatten.detach()
-                        print(delta_w.item())
                     else:
                         tmp1 = torch.dot(grad_e, grad_proj_flatten)
                         delta_w = torch.sign(tmp1).detach()
-                        new_w = max(self.w_init, min(self.w_init - self.mu * delta_w, 1e6))
+                        new_w = max(self.w_init, min(self.w_init - self.mu * delta_w, self.w_cap))
                         w+=new_w
                         self.w.append(new_w)
                         self.pre_g_hat.append(grad_proj_flatten.detach())
@@ -91,7 +94,8 @@ def AEGIS(prompt, dataset_retain, retain_batch, retain_train, retain_step, retai
                train_method, norm_layer, component, start_guidance, negative_guidance, iterations, save_interval, lr,
                config_path, ckpt_path, diffusers_config_path, output_dir, devices, seperator=None, image_size=512,
                ddim_steps=50, adv_prompt_num=3, attack_embd_type='word_embd', attack_type='prefix_k',
-               attack_init='latest', warmup_iter=200, attack_step=30, attack_lr=1e-2, adv_prompt_update_step=20):
+               attack_init='latest', warmup_iter=200, attack_step=30, attack_lr=1e-2, adv_prompt_update_step=20,
+               gp_mu=0.1, gp_w_cap=1.0):
     quick_sample_till_t = lambda x, s, code, batch, t: sample_model(model, sampler,
                                                                     x, image_size, image_size, ddim_steps, s, ddim_eta,
                                                                     start_code=code, n_samples=batch, till_T=t,
@@ -145,13 +149,13 @@ def AEGIS(prompt, dataset_retain, retain_batch, retain_train, retain_step, retai
         parameters_orig = param_choices(model=model_orig, train_method=train_method, component=component,
                                         final_layer_norm=norm_layer)
 
-    gradient_GP = GP(parameters_orig)
+    gradient_GP = GP(parameters_orig, mu=gp_mu, w_cap=gp_w_cap)
     losses = []
     opt = torch.optim.Adam(parameters, lr=lr)
     criteria = torch.nn.MSELoss()
     history = []
 
-    name = train_method
+    name = f'{train_method}-{word_print}'
 
     # ========== Stage 2: Training ==========
     pbar = tqdm(range(iterations))
@@ -358,7 +362,14 @@ if __name__ == '__main__':
                         required=False)
     parser.add_argument('--iterations', help='iterations used to train', type=int, required=False, default=1000)
     parser.add_argument('--save_interval', help='iterations used to train', type=int, required=False, default=200)
-    parser.add_argument('--lr', help='learning rate used to train', type=int, required=False, default=1e-5)
+    parser.add_argument('--lr', help='learning rate used to train', type=float, required=False, default=1e-5)
+
+    # GRP hyperparameters. Defaults follow the paper (App. F.3 mu=0.1, Alg. 2 caps omega at 1).
+    # To reproduce the numbers as the released code computed them: --gp_mu 0.2 --gp_w_cap 1e6
+    parser.add_argument('--gp_mu', help='DGR step size mu for adapting omega', type=float, required=False,
+                        default=0.1)
+    parser.add_argument('--gp_w_cap', help='upper clamp on the DGR projection weight omega', type=float,
+                        required=False, default=1.0)
 
     # Attack hyperparameters
     parser.add_argument('--adv_prompt_num', help='number of prompt token for adversarial soft prompt learning',
@@ -415,6 +426,8 @@ if __name__ == '__main__':
     attack_lr = args.attack_lr
     adv_prompt_update_step = args.adv_prompt_update_step
     warmup_iter = args.warmup_iter
+    gp_mu = args.gp_mu
+    gp_w_cap = args.gp_w_cap
 
     # Directory setup
     experiment_name = f'AEGIS'
@@ -442,4 +455,5 @@ if __name__ == '__main__':
                output_dir=output_dir, devices=devices, seperator=seperator, image_size=image_size,
                ddim_steps=ddim_steps, adv_prompt_num=adv_prompt_num, attack_embd_type=attack_embd_type,
                attack_type=attack_type, attack_init=attack_init, warmup_iter=warmup_iter, attack_step=attack_step,
-               attack_lr=attack_lr, adv_prompt_update_step=adv_prompt_update_step)
+               attack_lr=attack_lr, adv_prompt_update_step=adv_prompt_update_step,
+               gp_mu=gp_mu, gp_w_cap=gp_w_cap)

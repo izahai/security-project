@@ -7,3 +7,11 @@ archive/
 *.out
 *.sb
 *.ckpt
+
+# reproduce-run artifacts: cloned harnesses, downloaded data, trained weights
+external/
+data/imgs/
+*.zip
+*.pt
+setup/.env
+aegis-paper.pdf

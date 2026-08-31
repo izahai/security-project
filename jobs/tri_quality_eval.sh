@@ -1,11 +1,19 @@
 #!/bin/bash
 
+# Score the folders jobs/fid_10k_generate.sh produced. Same args:
+#   bash jobs/tri_quality_eval.sh nudity church          (default: all three)
 JOBS=("fid" "clip")
-DIRS=("")
+CONCEPTS=(nudity VanGogh church)
+[ $# -gt 0 ] && CONCEPTS=("$@")
+
+CKPT_DIR="results/results_with_AEGIS/AEGIS/models"
 NUMS=("999")
 
-GPU_START=0  # GPU starting ID
-GPU_END=3    # GPU ending ID
+DIRS=()
+for c in "${CONCEPTS[@]}"; do DIRS+=("$CKPT_DIR/Diffusers-UNet-full-$c-epoch"); done
+
+GPU_START=0
+GPU_END=$(( $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l) - 1 ))
 
 JOB_NUM=1
 
