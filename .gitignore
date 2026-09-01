@@ -13,5 +13,8 @@ external/
 data/imgs/
 *.zip
 *.pt
+*.npy
+ringabell/vectors/
+ringabell/invprompt/
 setup/.env
 aegis-paper.pdf

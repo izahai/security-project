@@ -70,8 +70,9 @@ if wants preflight && ! is_done preflight; then
   if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | sed 's/^/   gpu /'
     VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | sort -n | tail -1)
-    if   [ "$VRAM" -ge 40000 ]; then echo "   ${VRAM} MiB: can train and attack"
-    elif [ "$VRAM" -ge 16000 ]; then echo "   ${VRAM} MiB: attacks and generation only -- training needs >=40 GB"
+    if   [ "$VRAM" -ge 32000 ]; then echo "   ${VRAM} MiB: can train and attack"
+    elif [ "$VRAM" -ge 22000 ]; then echo "   ${VRAM} MiB: attacks and generation fine; training peaks ~26 GB, borderline"
+    elif [ "$VRAM" -ge 16000 ]; then echo "   ${VRAM} MiB: attacks and generation only -- training needs ~26 GB"
     else echo "   WARN: ${VRAM} MiB is below the 16 GB the attacks need"; fi
   else
     echo "   no nvidia-smi: setup will complete, but nothing can be run here"

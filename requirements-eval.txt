@@ -3,3 +3,4 @@
 T2IBenchmark @ git+https://github.com/boomb0om/text2image-benchmark   # FID, used by img_retain_eval.py
 nudenet==2.0.9        # nudity detector for Table 2
 gdown                 # setup/fetch_assets.sh pulls the WikiArt classifier from Drive
+huggingface_hub       # setup/fetch_assets.sh pulls the gated Ring-A-Bell nudity InvPrompt (ASR3)

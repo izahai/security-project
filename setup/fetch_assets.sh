@@ -39,6 +39,43 @@ if [ "${FETCH_BASELINES:-0}" = "1" ]; then
     gdown 1yeZNJ8MoHsisdZmt5lbnG_kSgl5xned0 -O others_ckpt.zip   && unzip -q others_ckpt.zip   && rm others_ckpt.zip )
 fi
 
+# --- 4b. Ring-A-Bell (ASR3). Concept vectors ship in the repo; nudity InvPrompts are
+#         gated. Van Gogh + church InvPrompts are generated on the VM by
+#         ringabell/inverse_prompt.py, and church's concept vector by get_concept_vector.py.
+mkdir -p ringabell/vectors ringabell/invprompt
+if [ ! -d external/Ring-A-Bell ]; then
+  git clone --depth 1 https://github.com/chiayi-hsu/Ring-A-Bell.git external/Ring-A-Bell
+fi
+for v in Nudity VanGogh; do
+  src="external/Ring-A-Bell/Concept Vectors/${v}_vector.npy"
+  dst="ringabell/vectors/$(echo "$v" | tr 'A-Z' 'a-z')_vector.npy"
+  [ -f "$src" ] && cp -n "$src" "$dst"
+done
+
+# Gated nudity InvPrompt. Needs HF_TOKEN whose account was granted access at
+# huggingface.co/datasets/Chia15/RingABell-Nudity. Normalised to the columns
+# generate-example-img.py expects. If unavailable, GA it via inverse_prompt.py instead.
+if [ ! -f ringabell/invprompt/nudity.csv ]; then
+  if [ -n "${HF_TOKEN:-}" ]; then
+    python - <<'PY' || echo "SKIP: nudity InvPrompt download failed (access not granted?). Request it, or GA with inverse_prompt.py." >&2
+import os, glob, pandas as pd
+from huggingface_hub import snapshot_download
+d = snapshot_download(repo_id="Chia15/RingABell-Nudity", repo_type="dataset",
+                      token=os.environ["HF_TOKEN"], local_dir="external/RingABell-Nudity")
+csvs = glob.glob(os.path.join(d, "**", "*.csv"), recursive=True)
+if not csvs:
+    raise SystemExit("no CSV in the gated dataset")
+df = pd.read_csv(csvs[0])
+col = next((c for c in df.columns if c.lower() in ("prompt", "text", "adv_prompt", "invprompt")), df.columns[-1])
+out = pd.DataFrame({"case_number": range(len(df)), "prompt": df[col].astype(str), "evaluation_seed": [6666] * len(df)})
+out.to_csv("ringabell/invprompt/nudity.csv", index=False)
+print(f"wrote ringabell/invprompt/nudity.csv ({len(out)} prompts, denominator for ASR3 nudity)")
+PY
+  else
+    echo "SKIP: nudity InvPrompt needs HF_TOKEN with access to Chia15/RingABell-Nudity (gated)." >&2
+  fi
+fi
+
 # --- 5. SD v1.4 CompVis checkpoint for training. Needs a HF token with the
 #        CompVis licence accepted.
 mkdir -p models
@@ -62,6 +99,7 @@ fi
 echo
 echo "done. present:"
 for p in external/Diffusion-MU-Attack external/Diffusion-MU-Attack/results/checkpoint-2800 \
+         external/Ring-A-Bell ringabell/vectors/vangogh_vector.npy \
          models/sd-v1-4-full-ema.ckpt data/imgs/coco_10k data/prompts/dma_church.csv; do
   [ -e "$p" ] && echo "  ok      $p" || echo "  MISSING $p"
 done

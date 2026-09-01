@@ -37,9 +37,13 @@ single biggest time sink, so confirm it before anything downloads.
 
 | VRAM | Runnable |
 |---|---|
-| ≥ 40 GB | everything (`GP` holds three extra per-parameter copies on top of Adam's two) |
-| 24 GB | attacks + image generation; **not** training |
+| ≥ 32 GB | everything, with room |
+| 24 GB | attacks + generation for sure; training peaks ~26 GB so it is borderline — try it |
 | < 16 GB | nothing |
+
+Training is fp32 end to end (no autocast anywhere) with two resident UNets plus
+`GP.pre_g_hat`; that, not activations, is the ~26 GB. `--devices 0,1` looks like a
+way out but crashes: `GP.DGR` subtracts `model_orig`'s params with no `.to()`.
 
 Training is only ~6 GPU-h of the ~136 total, so a 24 GB box is still useful:
 train elsewhere, copy the three `Diffusers-UNet-*.pt` files (3.4 GB each) in,

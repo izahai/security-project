@@ -5,8 +5,9 @@ Scope: the **AEGIS** row only — nudity (Table 2, n=142), Van Gogh (Table 3, n=
 [UnlearnDiffAtk leaderboard](https://huggingface.co/spaces/Intel/UnlearnDiffAtk-Benchmark);
 they are measured on the same published prompt sets, so they do not need re-running.
 
-ASR1 (P4D) and ASR2 (UnlearnDiffAtk) plus FID and CLIP are covered here.
-ASR3 (Ring-A-Bell) is not — see the last section for why.
+ASR1 (P4D), ASR2 (UnlearnDiffAtk), FID and CLIP are the main path (Phases 0–4). ASR3
+(Ring-A-Bell) is a separate transfer-attack workflow with its own caveats — see the last
+section.
 
 ## Where the pieces come from
 
@@ -37,7 +38,7 @@ The two halves run in **separate conda envs** and are joined by exactly one arti
 cp setup/env.example setup/.env && $EDITOR setup/.env    # AEGIS_DATA_ROOT, HF_TOKEN
 bash setup/bootstrap.sh
 
-# --- Phase 1: train, 3 concepts (~6 GPU-h total, needs >=40 GB VRAM)
+# --- Phase 1: train, 3 concepts (~6 GPU-h total, ~26 GB VRAM peak -- 32 GB safe)
 for C in nudity "Van Gogh" church; do
   python train-scripts/AEGIS.py --prompt "$C" --train_method full \
       --attack_init random --attack_step 1 --save_interval 1000
@@ -102,7 +103,7 @@ SD v1.4 at 100%.
 
 | Phase | GPU-h | VRAM |
 |---|---|---|
-| Train × 3 concepts | 6 | **≥40 GB** (paper: 1× A6000, 2.01 h/concept) |
+| Train × 3 concepts | 6 | **~26 GB peak**, 32 GB safe (paper used 1× A6000, 2.01 h/concept) |
 | FID/CLIP generation + scoring | 8.5 | 12 GB |
 | ASR1 + ASR2, all 3 concepts | 122 | 24 GB |
 | | **~136** | |
@@ -111,29 +112,80 @@ SD v1.4 at 100%.
 plain stride with no coordination.
 
 Attacks are batch-1 and latency-bound, so clock and bandwidth matter more than peak FLOPS. An
-RTX 4090 (24 GB) is the best value for Phases 2–3 but **cannot train** — the `GP` class holds three
-extra per-parameter copies on top of Adam's two. An L40S or A6000 (48 GB) does everything. Avoid a
-T4: it turns 136 GPU-h into roughly 400.
+RTX 4090 (24 GB) is the best value for Phases 2–3 and *may* train, but it is borderline — see below.
+An L40S or A6000 (48 GB) does everything with room. Avoid a T4: it turns 136 GPU-h into roughly 400.
+
+Where the training ~26 GB goes (fp32 throughout — there is no autocast or `.half()` in the training
+path, and gradient checkpointing is already on via `use_checkpoint: True` in the CompVis yaml):
+
+| | GB |
+|---|---|
+| `model`, trainable LatentDiffusion (UNet 859.5M + VAE 83.7M + CLIP 123.1M) | 4.3 |
+| `model_orig`, frozen reference — `--devices` defaults to `0,0`, so same GPU | 4.3 |
+| separate HF `CLIPTextModel` (both `CustomTextEncoder`s wrap one object) + `all_embeddings` | 0.6 |
+| Adam m+v over the 859.5M UNet params (`full` selects `model.model.diffusion_model` only) | 6.9 |
+| gradients | 3.4 |
+| `GP.pre_g_hat` | 3.4 |
+| activations (batch 1, checkpointed) + allocator slack | ~3 |
 
 Cheapest split: rent one 48 GB card for the ~6 h of training, keep the three `Diffusers-*.pt` files
-(3.4 GB each), then move to 24 GB cards for the ~130 h of attacks.
+(3.4 GB each), then move to 24 GB cards for the ~130 h of attacks. If you only have 24 GB, try
+training there first — it is close enough that it may just fit; the peak is the attack backward
+inside `soft_prompt_attack_max`.
 
 **Disk: provision 100 GB.** Roughly: conda env 12, SD v1.4 ckpt 7.7, HF diffusers cache 5, style
 classifier 1.8, COCO reals 1.3, AEGIS checkpoints 23, attack images 10, FID/CLIP images 12. The 30k
 generated images are disposable once FID and CLIP have been read off (−12 GB); attack images must
 survive until Phase 4, since both aggregators walk `images/` alongside `log.json`.
 
-## ASR3 (Ring-A-Bell) — not covered
+## ASR3 (Ring-A-Bell) — Phase 5
 
-Deliberately deferred; it is the least reproducible column in the paper.
+Ring-A-Bell is a **transfer** attack: adversarial ("InvPrompt") prompts are found offline using
+only the CLIP text encoder + a concept vector, then fed to the erased model. So it splits in two:
 
-- The hyperparameters are never given. App. F.4 says "Settings for the **two** attacks are in
-  Appx. F.4" while listing three, and the settings it does describe (N prepended tokens, 50
-  timesteps, 40 iterations, AdamW lr 0.01) only apply to P4D and UnlearnDiffAtk. Ring-A-Bell is a
-  genetic search with an entirely different parameter set (K, η, population, generations), none of
-  which appears anywhere in the paper.
-- `chiayi-hsu/Ring-A-Bell` ships notebooks only, no CLI.
-- Its `Concept Vectors/` has Nudity, VanGogh, Violence and Car — **no Church**, so Table 4's ASR3
-  needs a concept vector built from scratch via `Get_Concept_Vector.ipynb`.
-- The nudity InvPrompts live in a gated HF dataset (`Chia15/RingABell-Nudity`) that requires an
-  access request. Send it early if you intend to do this column.
+- **Tier 1 — InvPrompt (model-free).** A genetic search per concept, once, independent of the AEGIS
+  checkpoint. Ported verbatim from `chiayi-hsu/Ring-A-Bell` (notebooks only, no CLI) into
+  `ringabell/inverse_prompt.py`; the church concept vector, which Ring-A-Bell never published, is
+  built by `ringabell/get_concept_vector.py` from authored prompt pairs.
+- **Tier 2 — score.** Generate from the InvPrompt CSV with the **same** `Diffusers-*.pt` as FID/CLIP,
+  then detect the concept. `jobs/run_ringabell.sh` + `jobs/score_ringabell.sh` reuse the nudity
+  (`nudenet-classes.py`) and object (`imageclassify.py`) detectors already in `eval-scripts/`; Van
+  Gogh gets a new `eval-scripts/vangogh_classify.py` loading the WikiArt ViT (`checkpoint-2800`)
+  already fetched for ASR2.
+
+```bash
+# assets: setup/fetch_assets.sh clones Ring-A-Bell (concept vectors) and, if HF_TOKEN has access,
+# the gated nudity InvPrompt into ringabell/invprompt/nudity.csv.
+
+conda activate AEGIS   # tier 1 + tier 2 both run in the training env (CLIP + diffusers)
+
+# tier 1: build church vector, then GA Van Gogh + church InvPrompts (~8 GPU-h; nudity was fetched)
+python ringabell/get_concept_vector.py \
+    --concept ringabell/church_concept.csv --anti ringabell/church_anticoncept.csv \
+    --out ringabell/vectors/church_vector.npy
+for C in vangogh church; do
+  python ringabell/inverse_prompt.py --concept_vector ringabell/vectors/${C}_vector.npy \
+      --anchor_prompts data/prompts/dma_${C}.csv --eta 3 --length 16 \
+      --out ringabell/invprompt/${C}.csv
+done
+
+# tier 2: generate with the erased UNet + detect (<1 GPU-h, 242 images total)
+for C in nudity vangogh church; do
+  bash jobs/run_ringabell.sh $C
+  bash jobs/score_ringabell.sh $C
+done
+```
+
+**Caveats — this is the least reproducible column, read before trusting the numbers:**
+
+- **`--eta 3 --length 16` (K=16, η=3) are our choice, not the paper's.** AEGIS never states any
+  Ring-A-Bell hyperparameter (App. F.4 says "the **two** attacks" while listing three; its N/50-step/
+  40-iter/lr-0.01 settings are P4D + UnlearnDiffAtk only). η=3 is the notebook's nudity default; there
+  is no published η for style or objects. If numbers are off, sweep η∈{2,3,4} first.
+- **The church concept vector is authored** (`ringabell/church_concept.csv` / `church_anticoncept.csv`)
+  — Ring-A-Bell publishes no church vector or InvPrompt. This is the weakest link of the three.
+- **Nudity denominator differs.** The gated Ring-A-Bell nudity set is its own size (~95), not the
+  n=142 of ASR1/ASR2; `score_ringabell.sh` reports over that set's own count. Van Gogh / church reuse
+  the n=50 DMA prompt sets as GA anchors, so those denominators stay 50.
+- **ASR3 target numbers**: read them off the paper's Table 2/3/4 to fill the column — not transcribed
+  here yet.

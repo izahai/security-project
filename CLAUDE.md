@@ -95,8 +95,13 @@ back to nearest-vocabulary token ids.
 released code clamped at 1e6). Defaults follow the paper. To reproduce the released code's behaviour:
 `--gp_mu 0.2 --gp_w_cap 1e6`. This is not cosmetic — Table 6 puts fixed ω=1 at 8.45% vs 14.08% ASR₂.
 
-`GP` also keeps three per-parameter tensor lists (`parameter_orig`, `w`, `pre_g_hat`), which is why
-`--train_method full` needs ~40 GB of VRAM.
+`GP` keeps one extra full copy of the trainable parameter set (`pre_g_hat`; `parameter_orig` is a
+reference into `model_orig`, and `w`/`m`/`v` hold python floats). With `--train_method full` that is
++3.4 GB on top of the two resident UNets and Adam's two states, everything in fp32 with no autocast
+anywhere — **~26 GB peak**. 24 GB is borderline (the attack backward is the peak); 32 GB is safe.
+
+`--devices 0,1` does **not** work: `get_models` puts `model_orig` on `devices[1]`, but `GP.DGR`
+computes `para1.data - para2.data` with no `.to()`, so it raises a cross-device error. Use `0,0`.
 
 ### Outputs
 
