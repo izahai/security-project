@@ -1,6 +1,6 @@
 ---
 name: vast-lifecycle
-description: Use when the user pastes a vast.ai SSH command for a fresh rented GPU box (they rent then destroy repeatedly to save money). Runs the full ephemeral-box lifecycle - connect, clone, setup, push local ckpts up to skip retraining, hand off to the run, then pull artifacts and verify before destroy. Wraps the aegis-setup skill.
+description: Use when the user pastes a vast.ai SSH command for a fresh rented GPU box (they rent then destroy repeatedly to save money). Runs the full ephemeral-box lifecycle - connect, clone, setup, pull trained ckpts from HF to skip retraining, hand off to the run, then push artifacts to HF before destroy. Wraps the aegis-setup skill.
 ---
 
 # vast.ai box lifecycle
@@ -57,17 +57,22 @@ downloads); step 3 is the money lever.
    > Then every future box is one `scp` instead of re-pasting the token. It never
    > gets committed (`.gitignore`), so it is safe and it stays local.
 
-3. **Skip the 6 GPU-h retrain — push trained ckpts UP.** The nudity ckpts are
-   already trained and verified local. Do NOT let the box retrain them:
+3. **Skip the 6 GPU-h retrain — pull trained ckpts from HF.** The nudity ckpts
+   are already trained and live in the private HF repo `Noridom1/aegis-ckpts`.
+   Pull them ON THE BOX (box net ~20 MB/s beats laptop upload ~1 MB/s — never scp
+   these from the laptop):
    ```bash
-   $SSH 'mkdir -p /workspace/security-project/results/results_with_AEGIS/AEGIS/models'
-   $SCP results/results_with_AEGIS/AEGIS/models/Diffusers-UNet-full-nudity-epoch_999.pt \
-        results/results_with_AEGIS/AEGIS/models/Compvis-UNet-full-nudity-epoch_999.pt \
-        $HOST:/workspace/security-project/results/results_with_AEGIS/AEGIS/models/
+   $SSH 'cd /workspace/security-project \
+     && mkdir -p results/results_with_AEGIS/AEGIS/models \
+     && cd results/results_with_AEGIS/AEGIS/models \
+     && hf download Noridom1/aegis-ckpts Diffusers-UNet-full-nudity-epoch_999.pt \
+          --repo-type model --local-dir .'
    ```
-   The `Diffusers-*.pt` is all Phases 2–4 need (gen/FID/CLIP + DMA attacks). Only
-   push the Compvis one if resuming training. Only nudity is trained so far —
-   Van Gogh / church still need Phase 1 on the box.
+   `hf` needs the write/read token — `bootstrap` already exported `HF_TOKEN` from
+   `setup/.env`. The `Diffusers-*.pt` is all Phases 2–4 need (gen/FID/CLIP + DMA
+   attacks); only pull the Compvis one (same repo) if resuming training. Only
+   nudity is on HF so far — Van Gogh / church still need Phase 1 on the box (and
+   get pushed to HF at the end, see below).
 
 ## What this box can run
 
@@ -84,30 +89,33 @@ Don't reconstruct commands — read it.
 
 ## Before destroy — this is irreversible
 
-Destroy wipes the box. Pull everything irreplaceable DOWN and **verify by hash**
-before the user clicks destroy. The only expensive artifacts are trained ckpts
-(~6 GPU-h each to remake); eval results are cheap but pull them too.
+Destroy wipes the box. Push everything irreplaceable **UP to HF from the box**
+(box net ~20 MB/s, no laptop bottleneck), then destroy. The only expensive
+artifacts are trained ckpts (~6 GPU-h each to remake); eval results are cheap but
+push them too. Do NOT scp DOWN to the laptop — that's the ~1 MB/s path we're
+avoiding.
 
 ```bash
-# ckpts (only ones the box produced that you don't already have — e.g. new concepts)
-$SCP $HOST:'/workspace/security-project/results/results_with_AEGIS/AEGIS/models/*.pt' \
-     results/results_with_AEGIS/AEGIS/models/
-# eval outputs
-$SCP -r $HOST:/workspace/security-project/eval-artifacts/ ./eval-artifacts/
-
-# verify byte-exact BEFORE destroy: md5 must match both ends
-$SSH 'md5sum /workspace/security-project/results/results_with_AEGIS/AEGIS/models/*.pt'
-md5sum results/results_with_AEGIS/AEGIS/models/*.pt
+$SSH 'cd /workspace/security-project && \
+  # new-concept ckpts, one file each (Diffusers is enough; add Compvis only to resume train)
+  hf upload Noridom1/aegis-ckpts \
+    results/results_with_AEGIS/AEGIS/models/Diffusers-UNet-full-vangogh-epoch_999.pt \
+    Diffusers-UNet-full-vangogh-epoch_999.pt --repo-type model && \
+  # eval outputs: TAR the image dirs first — thousands of tiny PNGs blow past HFs
+  # ~10k-files/folder guideline and rate-limit uploading one by one
+  tar czf eval-nudity.tar.gz eval-artifacts/ files/results/ && \
+  hf upload Noridom1/aegis-ckpts eval-nudity.tar.gz eval-nudity.tar.gz --repo-type model'
 ```
 
-Only when every hash matches: **safe to destroy.** State that plainly, then the
-user destroys. Ckpts/PNGs are gitignored — never commit them; they live only as
-these local copies.
+Verify AFTER the fact by pulling from HF at leisure — this does NOT block destroy.
+Once the `hf upload` commits print their URLs (exit 0): **safe to destroy.** State
+that plainly, then the user destroys. Ckpts/PNGs are gitignored — never commit
+them to git; they live in the HF repo, not the tree.
 
 ## Money rules (no persistence changes the math)
 
-- **Never pay to retrain.** Push local ckpts up (step 3). Retraining a concept you
-  already have is ~6 GPU-h wasted.
+- **Never pay to retrain.** Pull trained ckpts from HF (step 3). Retraining a
+  concept you already have is ~6 GPU-h wasted.
 - **Setup ~1 h is the floor** with no persistent volume — it is a download hour on
   a GPU box. Accept it; the lever is not repeating work *inside* the run.
 - **Destroy promptly.** An idle box still bills. Pull + verify, then destroy.
