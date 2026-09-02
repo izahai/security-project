@@ -43,14 +43,14 @@ def get_openai_diffuser_transformer(diffuser_ckpt):
 
 
 def extract_text_encoder_ckpt(ckpt_path):
-    full_ckpt = torch.load(ckpt_path)
+    full_ckpt = torch.load(ckpt_path, weights_only=False)
     new_ckpt = {}
     for key in full_ckpt.keys():
         if 'text_encoder.text_model' in key:
             new_ckpt[key.replace("text_encoder.", "")] = full_ckpt[key]
     return new_ckpt
 
-def generate_images(model_name, prompts_path, save_path, device='cuda:0', guidance_scale = 7.5, image_size=512, ddim_steps=100, num_samples=10, from_case=0, folder_suffix='imagenette', origin_or_target='target'):
+def generate_images(model_name, prompts_path, save_path, device='cuda:0', guidance_scale = 7.5, image_size=512, ddim_steps=100, num_samples=10, from_case=0, folder_suffix='imagenette', origin_or_target='target', gen_batch_size=16, fp16=False):
     '''
     Function to generate images from diffusers code
     
@@ -121,6 +121,11 @@ def generate_images(model_name, prompts_path, save_path, device='cuda:0', guidan
             text_encoder.load_state_dict(extract_text_encoder_ckpt(target_ckpt), strict=False)
     scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
 
+    # fp16 halves VRAM and ~2x throughput on tensor cores. Cast after loading the
+    # fp32 target ckpt so load_state_dict doesn't upcast the module back to fp32.
+    dtype = torch.float16 if fp16 else torch.float32
+    if fp16:
+        vae = vae.half(); text_encoder = text_encoder.half(); unet = unet.half()
     vae.to(device)
     text_encoder.to(device)
     unet.to(device)
@@ -130,78 +135,59 @@ def generate_images(model_name, prompts_path, save_path, device='cuda:0', guidan
     folder_path = f'{save_path}/{model_name}'
     os.makedirs(folder_path, exist_ok=True)
 
+    height = image_size
+    width = image_size
+    max_length = tokenizer.model_max_length
+    scheduler.set_timesteps(ddim_steps)
+
+    from tqdm.auto import tqdm
+
+    # Flatten to one job per image. The latent is drawn here with the row's own
+    # seed (bit-identical to the per-row generation above) so batching across
+    # prompts changes nothing except throughput. Skip images already on disk so
+    # a killed run resumes for free.
+    jobs = []
     for _, row in df.iterrows():
-        prompt = [str(row.prompt)]*num_samples
-        seed = row.evaluation_seed
-        case_number = row.case_number
-        if case_number<from_case:
+        case_number = int(row.case_number)
+        if case_number < from_case:
             continue
+        gen = torch.manual_seed(int(row.evaluation_seed))
+        lats = torch.randn((num_samples, unet.in_channels, height // 8, width // 8), generator=gen)
+        for s in range(num_samples):
+            if os.path.exists(f"{folder_path}/{case_number}_{s}.png"):
+                continue
+            jobs.append((case_number, s, str(row.prompt), lats[s]))
 
-        height = image_size                        # default height of Stable Diffusion
-        width = image_size                         # default width of Stable Diffusion
+    for start in tqdm(range(0, len(jobs), gen_batch_size)):
+        batch = jobs[start:start + gen_batch_size]
+        prompts = [b[2] for b in batch]
+        latents = torch.stack([b[3] for b in batch]).to(torch_device).to(dtype)
 
-        num_inference_steps = ddim_steps           # Number of denoising steps
-
-        guidance_scale = guidance_scale            # Scale for classifier-free guidance
-
-        generator = torch.manual_seed(seed)        # Seed generator to create the inital latent noise
-
-        batch_size = len(prompt)
-
-        text_input = tokenizer(prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt")
-
+        text_input = tokenizer(prompts, padding="max_length", max_length=max_length, truncation=True, return_tensors="pt")
         text_embeddings = text_encoder(text_input.input_ids.to(torch_device))[0]
-
-        max_length = text_input.input_ids.shape[-1]
-        uncond_input = tokenizer(
-            [""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt"
-        )
+        uncond_input = tokenizer([""] * len(batch), padding="max_length", max_length=max_length, return_tensors="pt")
         uncond_embeddings = text_encoder(uncond_input.input_ids.to(torch_device))[0]
-
         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-
-        latents = torch.randn(
-            (batch_size, unet.in_channels, height // 8, width // 8),
-            generator=generator,
-        )
-        latents = latents.to(torch_device)
-
-        scheduler.set_timesteps(num_inference_steps)
 
         latents = latents * scheduler.init_noise_sigma
 
-        from tqdm.auto import tqdm
-
-        scheduler.set_timesteps(num_inference_steps)
-
-        for t in tqdm(scheduler.timesteps):
-            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+        for t in scheduler.timesteps:
             latent_model_input = torch.cat([latents] * 2)
-
             latent_model_input = scheduler.scale_model_input(latent_model_input, timestep=t)
-
-            # predict the noise residual
             with torch.no_grad():
                 noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
-
-            # perform guidance
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-            # compute the previous noisy sample x_t -> x_t-1
             latents = scheduler.step(noise_pred, t, latents).prev_sample
 
-        # scale and decode the image latents with vae
         latents = 1 / 0.18215 * latents
         with torch.no_grad():
             image = vae.decode(latents).sample
-
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
         images = (image * 255).round().astype("uint8")
-        pil_images = [Image.fromarray(image) for image in images]
-        for num, im in enumerate(pil_images):
-            im.save(f"{folder_path}/{case_number}_{num}.png")
+        for (case_number, s, _, _), im in zip(batch, images):
+            Image.fromarray(im).save(f"{folder_path}/{case_number}_{s}.png")
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(
@@ -217,8 +203,10 @@ if __name__=='__main__':
     parser.add_argument('--from_case', help='continue generating from case_number', type=int, required=False, default=0)
     parser.add_argument('--num_samples', help='number of samples per prompt', type=int, required=False, default=1)
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=100)
-    parser.add_argument('--folder_suffix', help='folder dir suff ix', type=str, required=True)
+    parser.add_argument('--folder_suffix', help='folder dir suffix', type=str, required=True)
     parser.add_argument('--origin_or_target', help='origin or target', type=str, required=False, default='target')
+    parser.add_argument('--batch_size', help='images generated per forward pass', type=int, required=False, default=8)
+    parser.add_argument('--fp16', help='run generation in float16 (faster, less VRAM)', action='store_true')
     args = parser.parse_args()
     
     model_name = args.model_name
@@ -235,4 +223,4 @@ if __name__=='__main__':
     origin_or_target = args.origin_or_target
     
     generate_images(model_name, prompts_path, save_path, device=device,
-                    guidance_scale = guidance_scale, image_size=image_size, ddim_steps=ddim_steps, num_samples=num_samples,from_case=from_case, folder_suffix = folder_suffix, origin_or_target=origin_or_target)
+                    guidance_scale = guidance_scale, image_size=image_size, ddim_steps=ddim_steps, num_samples=num_samples,from_case=from_case, folder_suffix = folder_suffix, origin_or_target=origin_or_target, gen_batch_size=args.batch_size, fp16=args.fp16)

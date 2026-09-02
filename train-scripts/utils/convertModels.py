@@ -799,9 +799,9 @@ def savemodelDiffusers(path, name, compvis_config_file, diffusers_config_file, d
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     else:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Sometimes models don't have the global_step item
     if "global_step" in checkpoint:

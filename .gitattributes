@@ -1,0 +1,3 @@
+# These run on Linux GPU boxes; keep LF even when authored on Windows so a
+# CRLF shebang / `set -euo pipefail\r` never reaches bash.
+*.sh text eol=lf
